@@ -1,8 +1,22 @@
-# Logitech G915 X LIGHTSPEED (046d:c356)
+# Logitech G915 X LIGHTSPEED — wireless 046d:c356 AND wired 046d:c359.
 # Only needed if you run g915x-heatmap as your own user instead of root.
-# Grants the logged-in user read/write on the keyboard's hidraw nodes.
-# (For evdev keypress reads, also add yourself to the `input` group.)
+#
+# Two distinct access paths matter here:
+#   1. hidraw write (the RGB protocol)  -> the rule below.
+#   2. evdev read (keypresses)          -> NOT granted here; the keyboard's
+#      /dev/input/event* node is owned by group `input` already, so just add
+#      yourself to that group:  sudo usermod -aG input <you>  (re-login).
 #
 # Install:  sudo cp 99-g915x.rules /etc/udev/rules.d/
 #           sudo udevadm control --reload && sudo udevadm trigger
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c356", TAG+="uaccess"
+#
+# c35[69] matches both the wireless (c356, via Lightspeed receiver) and the
+# wired (c359) product ids.
+#
+# Why GROUP+MODE *and* uaccess:
+#   - TAG+="uaccess" grants the currently-logged-in (active seat) user — works
+#     when you run the daemon by hand in your own session.
+#   - GROUP="input", MODE="0660" makes the node readable/writable by the `input`
+#     group regardless of session. This is what a session-less context needs;
+#     uaccess alone does NOT cover that case. (Harmless to keep both.)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c35[69]", GROUP="input", MODE="0660", TAG+="uaccess"

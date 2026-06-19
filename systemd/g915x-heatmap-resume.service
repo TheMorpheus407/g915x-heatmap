@@ -1,0 +1,17 @@
+[Unit]
+Description=Re-assert G915 X heatmap lighting after resume from sleep
+Documentation=https://github.com/TheMorpheus407/g915x-heatmap
+# The keyboard drops its software-controlled lighting state across host sleep;
+# restart the daemon once we're back so it re-runs the host-mode handshake and
+# repaints the board.
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+# Bare `systemctl` so systemd resolves it from its own path (works on FHS
+# distros). NixOS has no /bin/systemctl — there, use deploy/configuration-g915.nix,
+# which sets the absolute ${pkgs.systemd}/bin/systemctl path.
+ExecStart=systemctl --no-block restart g915x-heatmap.service
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

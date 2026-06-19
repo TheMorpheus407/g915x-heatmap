@@ -1,11 +1,49 @@
 #!/usr/bin/env python3
 """G915 X (046d:c356) HID++ probe step 1: find the vendor node, resolve features.
-SAFE: only sends IRoot ping + getFeature queries. No lighting changes."""
-import os, select, time
+SAFE: only sends IRoot ping + getFeature queries. No lighting changes.
 
-NODES = ['/dev/hidraw14', '/dev/hidraw15', '/dev/hidraw16']
+Usage: sudo python3 tools/probe1.py [-h]
+Run as root (needs read/write on the keyboard's /dev/hidrawN)."""
+import os, sys, glob, errno, select, time
+
 DEV = 0xFF
 SWID = 0x0f
+VENDOR_ID   = 0x046d
+PRODUCT_IDS = (0xc356, 0xc359)   # c356 = wireless/receiver, c359 = wired
+
+def _uevent_matches(text):
+    """True if a hidraw uevent is our keyboard: 046d:c356 (wireless) or
+    046d:c359 (wired). Reads the id from the HID_ID/MODALIAS line rather than a
+    loose 'C356' substring — mirrors _uevent_matches() in g915x-heatmap.py."""
+    vid = pid = None
+    for line in text.splitlines():
+        if line.startswith('HID_ID='):
+            parts = line.split('=', 1)[1].split(':')
+            if len(parts) == 3:
+                try: vid, pid = int(parts[1], 16), int(parts[2], 16)
+                except ValueError: pass
+        elif line.startswith('MODALIAS=') and (vid is None or pid is None):
+            m = line.split('=', 1)[1]
+            i, j = m.find('v'), m.find('p')
+            if i != -1 and j != -1 and j > i:
+                try: vid, pid = int(m[i+1:i+9], 16), int(m[j+1:j+9], 16)
+                except ValueError: pass
+    return vid == VENDOR_ID and pid in PRODUCT_IDS
+
+def find_nodes():
+    """Glob /dev/hidraw* and return the keyboard's nodes (046d:c356/c359),
+    matched by uevent id — not a hard-coded enumeration (which only works on the
+    machine it was read on). Mirrors find_hidraw() in g915x-heatmap.py."""
+    nodes = []
+    for path in sorted(glob.glob('/dev/hidraw*')):
+        n = os.path.basename(path)
+        try:
+            ue = open(f'/sys/class/hidraw/{n}/device/uevent').read()
+        except OSError:
+            continue
+        if _uevent_matches(ue):
+            nodes.append(path)
+    return nodes
 
 def hx(b):
     return ' '.join('%02x' % x for x in b)
@@ -54,14 +92,26 @@ def get_feature(fd, fid, long_form=False):
     return xfer(fd, rep)
 
 def is_error(resp):
-    # HID++2 error: 0xff feature index 0x08/0x8f patterns; classic: byte2==0xff
+    # HID++ error reply: byte 2 (feature index field) == 0xff.
     return resp is not None and len(resp) >= 3 and resp[2] == 0xff
+
+if '-h' in sys.argv[1:] or '--help' in sys.argv[1:]:
+    print(__doc__)
+    sys.exit(0)
+
+NODES = find_nodes()
+if not NODES:
+    print("G915 X (046d:c356) hidraw node not found. Is the keyboard on / receiver plugged in?",
+          file=sys.stderr)
+    sys.exit(1)
 
 for p in NODES:
     try:
         fd = os.open(p, os.O_RDWR)
     except OSError as e:
         print(f"{p}: open failed: {e}")
+        if e.errno in (errno.EACCES, errno.EPERM):
+            print("   hint: run as root, e.g. sudo python3 tools/probe1.py")
         continue
     try:
         drain(fd)

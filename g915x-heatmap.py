@@ -24,14 +24,25 @@ import os, sys, glob, time, select, struct, signal
 TICK      = 0.05          # render period (s) -> 20 Hz
 INCREMENT = 0.34          # heat added per keypress (~3 presses to max)
 HALFLIFE  = 25.0          # seconds for a key's heat to halve
-DECAY     = 0.5 ** (TICK / HALFLIFE)
 QUANT     = 12            # min per-channel colour change before a key is re-sent
 SWID      = 0x0d          # HID++ software id (any 1..15)
+WRITE_FAIL_LIMIT = 5      # consecutive hidraw write failures before forcing a reconnect
+
+# Supported USB product ids (idVendor is always 046d). c356 = wireless/receiver,
+# c359 = wired. Both share the LED-id map and HID++ feature set.
+VENDOR_ID    = 0x046d
+PRODUCT_IDS  = (0xc356, 0xc359)
 
 # Resolved at runtime in setup() — do NOT hard-code, they vary by model/firmware.
 DEV     = 0xFF            # HID++ device index (0xFF wireless-via-receiver, 0x01 wired)
 IDX8081 = None            # PER_KEY_LIGHTING feature index
 IDX8071 = None            # RGB_EFFECTS feature index
+
+
+class DeviceGone(Exception):
+    """Raised when a hidraw write/transport fails enough to mean the node is dead.
+    Caught by the outer lifecycle loop, which re-runs device discovery instead of
+    exiting. Never raised on a clean shutdown."""
 
 # ---------------- key -> LED id maps (confirmed on c356) ----------------
 # main keyboard zone: LED id = USB-HID-usage - 0x03 ; HID usage is positional,
@@ -63,15 +74,36 @@ def build_code2wire():
     return m
 
 # ---------------- HID++ transport ----------------
+# Consecutive write-failure counter. The evdev node alone is not a reliable
+# liveness signal: keyd's virtual keyboard keeps the same eventN across a
+# keyboard wake while the real hidrawN is replaced, so a frozen daemon would
+# otherwise write forever into a dead fd. We count OSErrors on write and force a
+# reconnect once they pile up. Any successful write resets the count.
+_write_fails = 0
+
+def _reset_write_fails():
+    global _write_fails
+    _write_fails = 0
+
+def _note_write_fail():
+    """Bump the consecutive write-failure counter; raise DeviceGone past the limit."""
+    global _write_fails
+    _write_fails += 1
+    if _write_fails >= WRITE_FAIL_LIMIT:
+        raise DeviceGone(f'{_write_fails} consecutive hidraw write failures')
+
 def frame(x):
     b = bytes.fromhex(x) if isinstance(x, str) else bytes(x)
     n = 20 if b[0] == 0x11 else 7
     return (b + bytes(n - len(b)))[:n] if len(b) < n else b[:n]
 
 def xfer(fd, report, timeout=0.4):
-    """Write a report, return the first HID++ reply for our device index."""
-    try: os.write(fd, frame(report))
-    except OSError: return None
+    """Write a report, return the first HID++ reply for our device index.
+    Returns None on transport failure (no reply / read error)."""
+    try:
+        os.write(fd, frame(report)); _reset_write_fails()
+    except OSError:
+        _note_write_fail(); return None
     dl = time.time() + timeout
     while time.time() < dl:
         r,_,_ = select.select([fd], [], [], max(0, dl - time.time()))
@@ -83,9 +115,12 @@ def xfer(fd, report, timeout=0.4):
     return None
 
 def hidpp_send(fd, report):
-    """Fire-and-forget write; drain any reply so the queue doesn't back up."""
-    try: os.write(fd, frame(report))
-    except OSError: pass
+    """Fire-and-forget write; drain any reply so the queue doesn't back up.
+    Counts write failures and raises DeviceGone once they cross WRITE_FAIL_LIMIT."""
+    try:
+        os.write(fd, frame(report)); _reset_write_fails()
+    except OSError:
+        _note_write_fail(); return
     dl = time.time() + 0.02
     while time.time() < dl:
         r,_,_ = select.select([fd], [], [], max(0, dl - time.time()))
@@ -94,23 +129,53 @@ def hidpp_send(fd, report):
         except OSError: break
 
 def get_feature_index(fd, feature_id):
-    """IRoot getFeature -> resolved index (0 = feature absent)."""
+    """IRoot getFeature -> resolved feature index.
+    Returns:
+      int  -- resolved index from a valid reply (0 means feature genuinely absent),
+      None -- no reply / transport failure / error reply (featureIndex 0xff)."""
     rep = xfer(fd, [0x10, DEV, 0x00, (0 << 4) | SWID, (feature_id >> 8) & 0xff, feature_id & 0xff, 0x00])
-    if rep and len(rep) >= 5 and rep[2] != 0xff:
-        return rep[4]
-    return 0
+    if rep is None:
+        return None                        # no reply / transport hiccup -> caller retries
+    if len(rep) >= 3 and rep[2] == 0xff:
+        # HID++ error reply (byte 2 = 0xff on this device; same convention as
+        # tools/probe1.py is_error) -> a transport error, NOT "feature absent".
+        return None
+    if len(rep) >= 5:
+        return rep[4]                      # valid reply; 0 == genuinely absent
+    return None
 
 # ---------------- device discovery ----------------
+def _uevent_matches(text):
+    """True if a hidraw uevent is our keyboard: idVendor==046d & idProduct in the
+    supported set. Parsed from the HID_ID (bus:vendor:product, hex) or MODALIAS
+    (...vVVVVpPPPP...) line — a real id match, not a loose 'C356' substring."""
+    vid = pid = None
+    for line in text.splitlines():
+        if line.startswith('HID_ID='):
+            parts = line.split('=', 1)[1].split(':')
+            if len(parts) == 3:
+                try: vid, pid = int(parts[1], 16), int(parts[2], 16)
+                except ValueError: pass
+        elif line.startswith('MODALIAS=') and (vid is None or pid is None):
+            # hid:bBBBBgGGGGvVVVVVVVVpPPPPPPPP -- vendor & product are 8 hex digits each.
+            m = line.split('=', 1)[1]
+            i, j = m.find('v'), m.find('p')
+            if i != -1 and j != -1 and j > i:
+                try: vid, pid = int(m[i+1:i+9], 16), int(m[j+1:j+9], 16)
+                except ValueError: pass
+    return vid == VENDOR_ID and pid in PRODUCT_IDS
+
 def find_hidraw():
-    """Return (path, fd) of the c356 vendor HID++ node, and set global DEV.
-    Tries device index 0xFF (wireless/receiver) then 0x01 (wired)."""
+    """Return (path, fd) of the keyboard's vendor HID++ node, and set global DEV.
+    Matches by USB id (046d:c356 wireless or 046d:c359 wired), then probes device
+    index 0xFF (wireless/receiver) before 0x01 (wired)."""
     global DEV
     for path in sorted(glob.glob('/dev/hidraw*')):
         n = os.path.basename(path)
         try: ue = open(f'/sys/class/hidraw/{n}/device/uevent').read()
         except OSError: continue
-        if 'C356' not in ue.upper(): continue
-        try: fd = os.open(path, os.O_RDWR)
+        if not _uevent_matches(ue): continue
+        try: fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
         except OSError: continue
         for devidx in (0xFF, 0x01):
             try: os.write(fd, frame([0x10, devidx, 0x00, (1 << 4) | SWID, 0, 0, 0x5a]))
@@ -119,7 +184,8 @@ def find_hidraw():
             while time.time() < dl:
                 r,_,_ = select.select([fd], [], [], max(0, dl - time.time()))
                 if not r: continue
-                d = os.read(fd, 64)
+                try: d = os.read(fd, 64)        # device may be yanked mid-probe
+                except OSError: break
                 if len(d) >= 4 and d[0] in (0x10, 0x11) and d[1] == devidx:
                     ok = True; break
             if ok:
@@ -132,29 +198,50 @@ def find_evdev():
     # Prefer keyd's virtual keyboard (keyd grabs the real device if you remap the
     # G-keys with it — see README); fall back to the physical G915 X keyboard.
     found = {}
+    keyd_seen = False                          # any 'keyd virtual keyboard' node at all
     blk = {}
-    for line in open('/proc/bus/input/devices'):
-        line = line.rstrip('\n')
-        if line.startswith('N: Name='): blk['name'] = line.split('=',1)[1].strip('"')
-        elif line.startswith('H: Handlers='): blk['h'] = line
-        elif line == '':
-            name = blk.get('name',''); h = blk.get('h','')
-            if 'kbd' in h:
-                node = next((t for t in h.split() if t.startswith('event')), None)
-                if node and name == 'keyd virtual keyboard': found['keyd'] = '/dev/input/'+node
-                elif node and name == 'Logitech G915 X LS':   found['g915'] = '/dev/input/'+node
-            blk = {}
-    return found.get('keyd') or found.get('g915')
+    try:
+        with open('/proc/bus/input/devices') as f:
+            for line in f:
+                line = line.rstrip('\n')
+                if line.startswith('N: Name='): blk['name'] = line.split('=',1)[1].strip('"')
+                elif line.startswith('H: Handlers='): blk['h'] = line
+                elif line == '':
+                    name = blk.get('name',''); h = blk.get('h','')
+                    if name == 'keyd virtual keyboard': keyd_seen = True
+                    if 'kbd' in h:
+                        node = next((t for t in h.split() if t.startswith('event')), None)
+                        if node and name == 'keyd virtual keyboard': found['keyd'] = '/dev/input/'+node
+                        elif node and name == 'Logitech G915 X LS':   found['g915'] = '/dev/input/'+node
+                    blk = {}
+    except OSError as e:
+        print(f'WARNING: cannot read /proc/bus/input/devices: {e}', file=sys.stderr, flush=True)
+        return None
+    if found.get('keyd'):
+        return found['keyd']
+    if found.get('g915') and keyd_seen:
+        # keyd is present (a virtual keyboard exists) but we only found the physical
+        # node — keyd has very likely grabbed the real device, so reading its evdev
+        # gives us NO keypresses and the heatmap silently freezes. Documented footgun.
+        print('WARNING: keyd virtual keyboard detected but using the physical G915 X '
+              'evdev node — if keyd grabbed the keyboard, keypresses will be invisible '
+              'and the heatmap will not update. Point the daemon at the keyd node.',
+              file=sys.stderr, flush=True)
+    return found.get('g915')
 
-def wait_devices():
+def wait_devices(running=None):
+    """Block until both the hidraw and evdev nodes exist. `running` is the shared
+    [bool] shutdown flag: a clean SIGTERM/SIGINT while waiting raises DeviceGone so
+    the outer loop can exit instead of spinning here forever."""
     announced = False
-    while True:
+    while running is None or running[0]:
         hpath, fd = find_hidraw()
         ev = find_evdev() if fd else None
         if fd and ev: return hpath, fd, ev
         if fd: os.close(fd)
         if not announced: print('waiting for G915 X...', flush=True); announced = True
         time.sleep(3)
+    raise DeviceGone('shutdown requested while waiting for device')
 
 # ---------------- colour / rendering ----------------
 def heat_color(h):
@@ -200,31 +287,43 @@ def host_mode_init(fd):
         hidpp_send(fd, bytes(b))
 
 # ---------------- main ----------------
-def setup():
+EV_FMT = 'llHHi'; EV_SZ = struct.calcsize(EV_FMT)
+
+def setup(running=None):
+    """Discover + open the device and resolve the lighting feature indices.
+    Returns (hpath, fd, evfd). Raises DeviceGone on a transport hiccup during
+    feature resolution (caller reconnects). Exits 1 only when a feature is a
+    genuine, valid 'absent' (resolved index 0) — i.e. truly unsupported hardware."""
     global IDX8081, IDX8071
-    hpath, fd, ev = wait_devices()
-    IDX8081 = get_feature_index(fd, 0x8081)
-    IDX8071 = get_feature_index(fd, 0x8071)
-    if not IDX8081 or not IDX8071:
-        print(f'ERROR: required HID++ features missing '
-              f'(0x8081={IDX8081:#x}, 0x8071={IDX8071:#x}). Unsupported variant?',
-              file=sys.stderr); sys.exit(1)
+    hpath, fd, ev = wait_devices(running)
+    try:
+        idx8081 = get_feature_index(fd, 0x8081)
+        idx8071 = get_feature_index(fd, 0x8071)
+        if idx8081 is None or idx8071 is None:
+            # No reply / error reply / transport failure — link hiccup, not an
+            # unsupported device. Bounce through the reconnect path instead of dying.
+            os.close(fd)
+            raise DeviceGone('feature resolution got no valid reply')
+        if idx8081 == 0 or idx8071 == 0:
+            print(f'ERROR: required HID++ features missing '
+                  f'(0x8081={idx8081:#x}, 0x8071={idx8071:#x}). Unsupported variant?',
+                  file=sys.stderr)
+            os.close(fd); sys.exit(1)
+        IDX8081, IDX8071 = idx8081, idx8071
+        evfd = os.open(ev, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except DeviceGone:
+        raise
+    except OSError:
+        try: os.close(fd)
+        except OSError: pass
+        raise DeviceGone('failed to open evdev node')
     print(f'hidraw={hpath} evdev={ev} devIdx={DEV:#x} '
           f'PER_KEY=0x{IDX8081:02x} RGB_EFFECTS=0x{IDX8071:02x}', flush=True)
-    return fd, ev
+    return hpath, fd, evfd
 
-def main():
-    fd, ev = setup()
-    evfd = os.open(ev, os.O_RDONLY | os.O_NONBLOCK)
-    code2wire = build_code2wire()
-    wire_ids = sorted(set(code2wire.values()))
-    heat = {w:0.0 for w in wire_ids}
-    last_rgb = {w:(-99,-99,-99) for w in wire_ids}
-
-    running = [True]
-    def stop(*_): running[0] = False
-    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
-
+def cold_fill(fd, wire_ids, heat, last_rgb):
+    """Take software control, paint the whole board cold, and render current heat.
+    May raise DeviceGone if the node dies during the handshake/fill."""
     host_mode_init(fd)
     cold = heat_color(0.0)
     set_range(fd, 0x01, 0x6f, cold)                          # all main keys + modifiers
@@ -232,14 +331,24 @@ def main():
     commit(fd)
     render(fd, wire_ids, heat, last_rgb)
 
-    EV_FMT = 'llHHi'; EV_SZ = struct.calcsize(EV_FMT)
+def run_session(fd, evfd, running, code2wire, wire_ids, heat, last_rgb):
+    """One device lifecycle: cold-fill then pump events until clean shutdown or
+    device loss. Heat/last_rgb persist across calls so a reconnect resumes, not
+    resets. Raises DeviceGone on device loss; returns normally on clean shutdown."""
+    if not running[0]: return                                # shutdown raced setup -> let main board-off
+    _reset_write_fails()
+    # last_rgb is reset so the post-reconnect cold-fill + render actually re-sends
+    # every key to the fresh node (the old node's accepted colours mean nothing now).
+    for w in wire_ids: last_rgb[w] = (-99, -99, -99)
+    cold_fill(fd, wire_ids, heat, last_rgb)
+
     last_tick = time.time()
     while running[0]:
         r,_,_ = select.select([evfd], [], [], TICK)
         if r:
             try: data = os.read(evfd, EV_SZ * 64)
-            except OSError: break                            # device gone -> exit; service restarts
-            if not data: break
+            except OSError: raise DeviceGone('evdev read error')
+            if not data: raise DeviceGone('evdev EOF')        # device gone -> reconnect, don't exit
             for off in range(0, len(data) - EV_SZ + 1, EV_SZ):
                 _,_,etype,code,val = struct.unpack(EV_FMT, data[off:off+EV_SZ])
                 if etype == 1 and val == 1:
@@ -247,13 +356,56 @@ def main():
                     if w is not None: heat[w] = min(1.0, heat[w] + INCREMENT)
         now = time.time()
         if now - last_tick >= TICK:
-            for w in wire_ids: heat[w] *= DECAY
+            # Scale decay by ACTUAL elapsed time so the 25 s half-life holds even
+            # when the scheduler delays a tick (fixed-step decay silently slowed it).
+            factor = 0.5 ** ((now - last_tick) / HALFLIFE)
+            for w in wire_ids: heat[w] *= factor
             render(fd, wire_ids, heat, last_rgb)
             last_tick = now
-    # on exit: whole board off
-    set_range(fd, 0x01, 0x6f, (0,0,0))
-    for a,b in STATIC_RANGES: set_range(fd, a, b, (0,0,0))
-    commit(fd)
+
+def board_off(fd):
+    """Whole board off — clean-shutdown only. Tolerates a vanished node."""
+    try:
+        set_range(fd, 0x01, 0x6f, (0,0,0))
+        for a,b in STATIC_RANGES: set_range(fd, a, b, (0,0,0))
+        commit(fd)
+    except (OSError, DeviceGone):
+        pass
+
+def main():
+    code2wire = build_code2wire()
+    wire_ids = sorted(set(code2wire.values()))
+    heat = {w:0.0 for w in wire_ids}                         # persists across reconnects
+    last_rgb = {w:(-99,-99,-99) for w in wire_ids}
+
+    running = [True]
+    def stop(*_): running[0] = False
+    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+
+    # Outer lifecycle loop: each iteration is one full device session. Device loss
+    # (evdev EOF/OSError, or N consecutive hidraw write failures into a dead fd)
+    # re-runs discovery + handshake + cold-fill instead of exiting, so a wake-from-
+    # sleep or a hidrawN swap relights the board without a systemd restart window.
+    while running[0]:
+        fd = evfd = None
+        try:
+            _, fd, evfd = setup(running)
+            run_session(fd, evfd, running, code2wire, wire_ids, heat, last_rgb)
+        except DeviceGone as e:
+            _close(fd); _close(evfd)
+            if not running[0]: break                         # clean shutdown raced the wait
+            print(f'device lost ({e}); reconnecting...', file=sys.stderr, flush=True)
+            time.sleep(1)                                    # brief breather before re-probe
+            continue                                         # NO board-off here — node is gone
+        # Clean shutdown only (signal flipped running[0]): turn the board off.
+        board_off(fd)
+        _close(fd); _close(evfd)
+        break
+
+def _close(fd):
+    if fd is not None:
+        try: os.close(fd)
+        except OSError: pass
 
 if __name__ == '__main__':
     main()

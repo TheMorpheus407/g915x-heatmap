@@ -2,6 +2,12 @@
 Description=Logitech G915 X typing heatmap (per-key RGB)
 Documentation=https://github.com/TheMorpheus407/g915x-heatmap
 After=multi-user.target
+# only relevant if you use keyd for G-key macros — keep the heatmap after keyd
+# grabs the keyboard (the daemon prefers keyd's virtual keyboard for evdev reads)
+Wants=keyd.service
+After=keyd.service
+# the daemon self-polls for the device — don't let the start-limiter wedge it
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,7 +16,36 @@ Type=simple
 # set User=<you> here.
 ExecStart=/usr/local/bin/g915x-heatmap.py
 Restart=always
-RestartSec=5s
+# self-polls for the device, so restart fast and never let the start-limiter wedge it
+RestartSec=2s
+
+# --- hardening: this daemon reads every keystroke as root; confine the blast
+# --- radius. The daemon is pure-stdlib Python, opens NO network sockets, reads
+# --- /dev/input/event* + /proc/bus/input/devices + /sys/class/hidraw/*, and
+# --- writes ONLY to /dev/hidraw* (no files). Every directive below is checked
+# --- to leave char-hidraw rw + char-input r intact.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# no sockets at all
+RestrictAddressFamilies=
+IPAddressDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# device scoping: deny all device nodes, then re-allow only the keyboard classes
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+DeviceAllow=char-input r
 
 [Install]
 WantedBy=multi-user.target

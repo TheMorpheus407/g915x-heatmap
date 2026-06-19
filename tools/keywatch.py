@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Print which G915 X key is pressed (key-down only), with a timestamp.
-Auto-finds the keyboard's evdev node. Labels reflect the physical QWERTZ key."""
+Auto-finds the keyboard's evdev node. Labels reflect the physical QWERTZ key.
+
+Usage: sudo python3 tools/keywatch.py [EVDEV_NODE] [-h]
+Pass an explicit /dev/input/eventN to override auto-detection."""
 import os, sys, struct, select, time
 
 # evdev keycode -> physical key label (German QWERTZ; Y/Z swapped vs QWERTY)
@@ -21,19 +24,32 @@ NAMES = {
 }
 
 def find_node():
+    # Prefer keyd's virtual keyboard: when the G-keys are remapped with keyd
+    # (the repo's flagship feature) keyd GRABS the physical device and re-emits
+    # events on "keyd virtual keyboard", so the G-keys only appear there.
+    # Fall back to the physical keyboard otherwise. Mirrors find_evdev() in
+    # g915x-heatmap.py.
+    found = {}
     blk = {}
     for line in open('/proc/bus/input/devices'):
         line = line.rstrip('\n')
         if line.startswith('N: Name='): blk['n'] = line.split('=',1)[1].strip('"')
         elif line.startswith('H: Handlers='): blk['h'] = line
         elif line == '':
-            if blk.get('n') == 'Logitech G915 X LS' and 'kbd' in blk.get('h',''):
-                for t in blk['h'].split():
-                    if t.startswith('event'): return '/dev/input/' + t
+            name = blk.get('n', ''); h = blk.get('h', '')
+            if 'kbd' in h:
+                node = next((t for t in h.split() if t.startswith('event')), None)
+                if node and name == 'keyd virtual keyboard': found['keyd'] = '/dev/input/' + node
+                elif node and name == 'Logitech G915 X LS':   found['g915'] = '/dev/input/' + node
             blk = {}
-    return None
+    return found.get('keyd') or found.get('g915')
 
-node = sys.argv[1] if len(sys.argv) > 1 else find_node()
+args = [a for a in sys.argv[1:] if a not in ('-h', '--help')]
+if len(args) != len(sys.argv[1:]):
+    print(__doc__)
+    sys.exit(0)
+
+node = args[0] if args else find_node()
 if not node:
     print('keyboard evdev node not found', file=sys.stderr); sys.exit(1)
 fd = os.open(node, os.O_RDONLY)

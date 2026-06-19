@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 *.pcapng
+*.pcap
 *.log
+.claude/
