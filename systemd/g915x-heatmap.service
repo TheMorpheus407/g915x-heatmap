@@ -1,0 +1,16 @@
+[Unit]
+Description=Logitech G915 X typing heatmap (per-key RGB)
+Documentation=https://github.com/TheMorpheus407/g915x-heatmap
+After=multi-user.target
+
+[Service]
+Type=simple
+# Runs as root for hidraw-write + evdev-read access. To run as a normal user
+# instead, install udev/99-g915x.rules, add yourself to the `input` group, and
+# set User=<you> here.
+ExecStart=/usr/local/bin/g915x-heatmap.py
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

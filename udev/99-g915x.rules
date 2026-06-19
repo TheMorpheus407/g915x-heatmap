@@ -1,0 +1,8 @@
+# Logitech G915 X LIGHTSPEED (046d:c356)
+# Only needed if you run g915x-heatmap as your own user instead of root.
+# Grants the logged-in user read/write on the keyboard's hidraw nodes.
+# (For evdev keypress reads, also add yourself to the `input` group.)
+#
+# Install:  sudo cp 99-g915x.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c356", TAG+="uaccess"
