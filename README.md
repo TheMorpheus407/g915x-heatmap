@@ -98,6 +98,29 @@ genuinely specific to the X is the **9 G-keys** (LED ids `0xB4–0xBC`).
 The wireless/Bluetooth/brightness "mode row" LEDs are **not individually
 addressable** on this model and are left dark by design.
 
+## Bonus: G-key macros (via keyd)
+
+The G-keys type as plain function keys — **G1–G9 = F13–F21** (keycodes 183–191) —
+so they're bindable like any key. For simple actions, bind F13–F21 in your
+desktop's shortcut settings. For held modifiers, chords or macros, use
+[keyd](https://github.com/rvaiya/keyd) (evdev-level, works on Wayland).
+
+keyd *grabs* the keyboard and re-emits on a "keyd virtual keyboard" device — this
+daemon already prefers that device automatically, so the heatmap keeps working
+(just start it after keyd). Example (NixOS) — make **G5 cycle browser tabs**:
+
+```nix
+services.keyd = {
+  enable = true;
+  keyboards.g915x = {
+    ids = [ "046d:c356" ];
+    settings.main = { f17 = "C-tab"; };   # G5 (F17) -> Ctrl+Tab
+  };
+};
+```
+
+G-key → keycode: `G1=f13 G2=f14 G3=f15 G4=f16 G5=f17 G6=f18 G7=f19 G8=f20 G9=f21`.
+
 ## How it works
 
 The keyboard speaks Logitech **HID++ 2.0** over a vendor hidraw interface. The

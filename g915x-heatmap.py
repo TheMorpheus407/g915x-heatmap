@@ -129,17 +129,22 @@ def find_hidraw():
     return None, None
 
 def find_evdev():
+    # Prefer keyd's virtual keyboard (keyd grabs the real device if you remap the
+    # G-keys with it — see README); fall back to the physical G915 X keyboard.
+    found = {}
     blk = {}
     for line in open('/proc/bus/input/devices'):
         line = line.rstrip('\n')
         if line.startswith('N: Name='): blk['name'] = line.split('=',1)[1].strip('"')
         elif line.startswith('H: Handlers='): blk['h'] = line
         elif line == '':
-            if blk.get('name') == 'Logitech G915 X LS' and 'kbd' in blk.get('h',''):
-                for tok in blk['h'].split():
-                    if tok.startswith('event'): return '/dev/input/' + tok
+            name = blk.get('name',''); h = blk.get('h','')
+            if 'kbd' in h:
+                node = next((t for t in h.split() if t.startswith('event')), None)
+                if node and name == 'keyd virtual keyboard': found['keyd'] = '/dev/input/'+node
+                elif node and name == 'Logitech G915 X LS':   found['g915'] = '/dev/input/'+node
             blk = {}
-    return None
+    return found.get('keyd') or found.get('g915')
 
 def wait_devices():
     announced = False
